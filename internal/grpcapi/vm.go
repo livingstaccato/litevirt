@@ -2778,6 +2778,12 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.operatorStopStartRefusal(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A start this host left paused (an interrupted daemon's: its record is
+	// still there, its domain paused) is finished, not started again: libvirt
+	// would refuse a second create of the running domain (rc9 lab F1).
+	if out, done, err := s.finishStartLeftPaused(ctx, vm); done {
+		return out, err
+	}
 	// A volume move this host left unresolved points the disk row at the file
 	// the persistent config names before anything reads the rows, or refuses
 	// the start (move_unresolved.go).
@@ -3120,7 +3126,30 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		noop = true
 		return true
 	}
-	if force {
+	// A paused guest cannot answer an ACPI shutdown (libvirt: "domain is not
+	// running"): a stop of one ends it as the timeout would, by a kill, under
+	// the same write-quarantine rule (rc9 lab F1: a start an interrupted
+	// daemon left paused could not be stopped).
+	paused := false
+	if !force {
+		if st, serr := s.virt.DomainStateReason(vm.Name); serr == nil && st.Reason == "paused" {
+			paused = true
+		}
+	}
+	if paused {
+		if reason := s.stopQuarantineReason(); reason != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q is paused, so it cannot shut down, and it was not killed: this host is in write quarantine (%s), "+
+					"so a kill could not be recorded and its restart policy would undo it; %s",
+				vm.Name, reason, s.quarantineRemedy())
+		}
+		slog.Info("StopVM: the guest is paused and cannot shut down; killing it", "vm", vm.Name)
+		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
+			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
+		}
+		// A start it was left paused by has ended now.
+		s.unmarkStartPaused(vm.Name)
+	} else if force {
 		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}

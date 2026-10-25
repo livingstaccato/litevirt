@@ -67,8 +67,10 @@ func TestResumeStrandedStarts(t *testing.T) {
 	if c, _ := cond(); c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("the condition after the finish: %s, want resolved", c.Lifecycle)
 	}
-	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StatePaused {
-		t.Fatal("a paused domain whose row is not running here was resumed")
+	// Its row is stopped, as an interrupted operator `lv start` leaves it:
+	// its own recorded start, finished too (rc9 lab F1).
+	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StateRunning {
+		t.Fatalf("the recorded start of a VM whose row is stopped was not finished: %v", st)
 	}
 	if marked, _ := s.startPausedMarked("vm1"); marked {
 		t.Fatal("the finished start's record outlived it")

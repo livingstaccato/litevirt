@@ -14,8 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -40,56 +45,141 @@ const (
 	CondStrandedStartPaused = "vm_start_stranded_paused"
 )
 
-// strandedStart reports whether vm's domain here is a start this daemon left
-// paused, safe to finish: a paused start of it is recorded here
-// (markStartPaused), the domain is paused, its row names this host and says
-// it runs or is starting, and nothing else holds it paused — no partition
-// pause mark on the live domain, no partition pause record in any layer
-// (memory, the reserve, the record directory), no hand-over, no firmware
-// hold. Any of those that cannot be read holds it too (fail closed): the sweep
-// never resumes a guest another part of litevirt may be holding, whatever its
-// own record says (review R2-B1).
-func (s *Server) strandedStart(ctx context.Context, vm string) bool {
+// strandedVerdict is what the sweep (and `lv start`) does with a recorded
+// paused start (classifyStrandedStart).
+type strandedVerdict int
+
+const (
+	// strandedDrop: the start has ended or can never be finished here (the
+	// domain is gone or no longer paused, its VM is gone or another
+	// host's): the record goes.
+	strandedDrop strandedVerdict = iota
+	// strandedHeld: something else holds the domain paused on purpose — a
+	// partition pause (its mark or its record), a hand-over, a firmware
+	// move — and reports it itself. Left paused, record kept, not named.
+	strandedHeld
+	// strandedRefuse: the start cannot be finished, and nothing else names
+	// the guest: left paused, record kept, named by vm_start_stranded_paused.
+	strandedRefuse
+	// strandedFinish: this daemon's own start of this incarnation, held by
+	// nothing: finish it (readyGuestHere, then resume).
+	strandedFinish
+)
+
+// strandedRowStates are the row states a start's VM can be in while its
+// paused start is unfinished: the reconciler's starts write starting (or keep
+// running), an operator `lv start` writes running only once the domain is up
+// (so the row is still stopped), and a restart-policy start leaves error
+// (rc9 lab finding F1).
+var strandedRowStates = map[string]bool{"running": true, "starting": true, "stopped": true, "error": true, "crashed": true}
+
+// classifyStrandedStart judges vm's recorded paused start. why says why for
+// strandedRefuse (the condition's text) and strandedHeld (a log line).
+//
+// Nothing is ever resumed here on a guess: a hold, or any of its evidence that
+// cannot be read, keeps the domain paused; a record whose incarnation does not
+// match the domain's, or holds none, keeps it paused (review NB-R14, M1-M3).
+func (s *Server) classifyStrandedStart(ctx context.Context, vm string) (strandedVerdict, string) {
 	marked, err := s.startPausedMarked(vm)
-	if err != nil || !marked {
-		return false
+	switch {
+	case err != nil:
+		return strandedRefuse, fmt.Sprintf("its start record cannot be read: %v", err)
+	case !marked:
+		return strandedDrop, "no start record"
 	}
 	st, err := s.virt.DomainStateReason(vm)
-	if err != nil || st.Reason != "paused" || (st.PausedReason != "user" && st.PausedReason != "starting-up") {
-		return false
+	switch {
+	case err != nil && lv.IsNoDomain(err):
+		// libvirt's own VIR_ERR_NO_DOMAIN, and nothing else: any other error
+		// (a dropped connection, a driver's "not found") keeps the record.
+		return strandedDrop, "no such domain here"
+	case err != nil:
+		return strandedRefuse, fmt.Sprintf("its domain's state cannot be read: %v", err)
+	case st.Reason != "paused":
+		return strandedDrop, "its domain is not paused: the start ended"
 	}
-	rec, err := corrosion.GetVM(ctx, s.db, vm)
-	if err != nil || rec == nil || rec.HostName != s.hostName || (rec.State != "running" && rec.State != "starting") {
-		return false
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	switch {
+	case err != nil:
+		return strandedRefuse, fmt.Sprintf("its VM row cannot be read: %v", err)
+	case row == nil || row.HostName != s.hostName:
+		return strandedDrop, "its VM is gone, or another host's now"
 	}
+	// Something else holding it paused comes first: it is left paused, and
+	// not reported as a stranded start (review M3).
 	marks, ok := s.virt.(interface {
 		PartitionPauseMark(name string) (string, bool, error)
 	})
 	if !ok {
-		return false
+		return strandedRefuse, "this host cannot read the partition pause mark"
 	}
-	if _, marked, merr := marks.PartitionPauseMark(vm); marked || merr != nil {
-		return false // partition pause's, or cannot be told apart from it
+	if _, pp, merr := marks.PartitionPauseMark(vm); pp {
+		return strandedHeld, "partition pause holds it (its mark)"
+	} else if merr != nil {
+		return strandedRefuse, fmt.Sprintf("whether partition pause holds it cannot be read (its mark: %v)", merr)
 	}
-	if _, paused, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vm); paused || perr != nil {
-		return false // partition pause's
+	if _, pp, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vm); pp {
+		return strandedHeld, "partition pause holds it (its record)"
+	} else if perr != nil {
+		return strandedRefuse, fmt.Sprintf("whether partition pause holds it cannot be read (its record: %v)", perr)
 	}
-	if _, held, herr := s.getHeld(vm); held || herr != nil {
-		return false // a hand-over's (resumeHeld)
+	if _, held, herr := s.getHeld(vm); held {
+		return strandedHeld, "a hand-over holds it"
+	} else if herr != nil {
+		return strandedRefuse, fmt.Sprintf("whether a hand-over holds it cannot be read: %v", herr)
 	}
-	if s.firmwareMoveHeld(vm) != nil {
-		return false // a live firmware move's
+	if ferr := s.firmwareMoveHeld(vm); ferr != nil {
+		return strandedHeld, ferr.Error()
 	}
-	return true
+	if st.PausedReason != "user" && st.PausedReason != "starting-up" {
+		return strandedRefuse, fmt.Sprintf("its domain is paused for another reason (%s) than a start", st.PausedReason)
+	}
+	if !strandedRowStates[row.State] {
+		return strandedRefuse, fmt.Sprintf("its VM row is %s, which no unfinished start leaves", row.State)
+	}
+	// The record's incarnation must be the domain's.
+	want, rerr := s.startPausedUUID(vm)
+	switch {
+	case rerr != nil:
+		return strandedRefuse, fmt.Sprintf("its start record cannot be read: %v", rerr)
+	case want == "":
+		return strandedRefuse, "its start record holds no readable domain uuid (the definition could not be read when the start was recorded), so the domain here cannot be shown to be that start's"
+	case !s.domainIsUUID(vm, want):
+		return strandedRefuse, fmt.Sprintf("its start record names another incarnation (uuid %s) than the domain here, or the domain's uuid cannot be read", want)
+	}
+	return strandedFinish, ""
 }
 
-// ResumeStrandedStarts readies and resumes every start this daemon recorded
-// as paused (markStartPaused) and did not finish, and names the ones it
-// cannot. Call it once, at daemon start, after the start guard and the first
-// firewall pass, before any start source and the gRPC server: nothing else
-// can be starting a domain then. A record whose domain is no longer paused (it
-// was resumed or stopped by other means, or is gone) is dropped. A domain
-// paused without a record is never resumed here.
+// finishStrandedStart finishes vm's recorded paused start: its NIC firewall
+// and VLANs (readyGuestHere, as a start), then the resume; the record goes,
+// and the condition resolves. An error leaves the guest paused, its record
+// kept, and the condition raised.
+func (s *Server) finishStrandedStart(ctx context.Context, vm string) error {
+	err := s.readyGuestHere(ctx, vm, startingHere)
+	if err == nil {
+		r, ok := s.virt.(interface{ ResumeDomain(string) error })
+		if !ok {
+			err = fmt.Errorf("this host cannot resume a domain")
+		} else if rerr := r.ResumeDomain(vm); rerr != nil {
+			err = fmt.Errorf("resume: %w", rerr)
+		}
+	}
+	if err != nil {
+		s.judgeStrandedStart(ctx, vm, err)
+		return err
+	}
+	s.unmarkStartPaused(vm)
+	s.judgeStrandedStart(ctx, vm, nil)
+	return nil
+}
+
+// ResumeStrandedStarts finishes every start this daemon recorded as paused
+// (markStartPaused) and did not finish, and names every one it keeps without
+// finishing, but for a guest something else holds (which that hold reports).
+// Call it once, at daemon start, after the start guard and the first firewall
+// pass, before any start source and the gRPC server: nothing else can be
+// starting a domain then. A domain paused without a record is never resumed
+// here.
 func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 	if s.virt == nil || s.db == nil {
 		return
@@ -99,66 +189,22 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		st, err := s.virt.DomainStateReason(vm)
-		switch {
-		case err != nil && lv.IsNoDomain(err):
-			// libvirt's own VIR_ERR_NO_DOMAIN, and nothing else: any other
-			// error (a dropped connection, a driver's "not found") keeps the
-			// record, since the domain may still be paused.
-			s.unmarkStartPaused(vm) // no such domain here: nothing to finish
-			continue
-		case err == nil && st.Reason != "paused":
-			s.unmarkStartPaused(vm) // it runs, or was stopped: the start ended
-			continue
-		}
-		if row, rerr := corrosion.GetVM(ctx, s.db, vm); rerr == nil && (row == nil || row.HostName != s.hostName) {
-			s.unmarkStartPaused(vm) // its VM is gone, or another host's now
-			continue
-		}
-		// Something else holding it comes first: such a domain is left
-		// paused, and is not reported as a stranded start (review M3).
-		if !s.strandedStart(ctx, vm) {
-			slog.Warn("start guard: a start this daemon left paused is held by something else, or cannot be judged; it stays paused",
-				"vm", vm)
-			continue
-		}
-		// The record's incarnation must be the domain's: a same-name domain
-		// of another uuid (deleted and created again since) is not this
-		// start's, and is never resumed by it. A record that holds no uuid
-		// (the definition could not be read when the start was recorded)
-		// cannot show the domain is that start's, and is not resumed either.
-		want, rerr := s.startPausedUUID(vm)
-		var refuse error
-		switch {
-		case rerr != nil:
-			refuse = fmt.Errorf("its start record cannot be read: %w", rerr)
-		case want == "":
-			refuse = errors.New("its start record holds no readable domain uuid (the definition could not be read when the start was recorded), so the domain here cannot be shown to be that start's")
-		case !s.domainIsUUID(vm, want):
-			refuse = fmt.Errorf("its start record names another incarnation (uuid %s) than the domain here, or the domain's uuid cannot be read", want)
-		}
-		if refuse != nil {
-			slog.Error("start guard: not finishing a paused start: "+refuse.Error(), "vm", vm)
-			s.judgeStrandedStart(ctx, vm, refuse)
-			continue
-		}
-		err = s.readyGuestHere(ctx, vm, startingHere)
-		if err == nil {
-			r, ok := s.virt.(interface{ ResumeDomain(string) error })
-			if !ok {
-				err = fmt.Errorf("this host cannot resume a domain")
-			} else if rerr := r.ResumeDomain(vm); rerr != nil {
-				err = fmt.Errorf("resume: %w", rerr)
+		verdict, why := s.classifyStrandedStart(ctx, vm)
+		switch verdict {
+		case strandedDrop:
+			s.unmarkStartPaused(vm)
+		case strandedHeld:
+			slog.Warn("start guard: a start this daemon left paused is held by something else; it stays paused", "vm", vm, "held_by", why)
+		case strandedRefuse:
+			slog.Error("start guard: not finishing a start an interrupted daemon left paused: "+why, "vm", vm)
+			s.judgeStrandedStart(ctx, vm, errors.New(why))
+		case strandedFinish:
+			if err := s.finishStrandedStart(ctx, vm); err != nil {
+				slog.Error("start guard: a start left paused by an interrupted daemon cannot be finished; it stays paused", "vm", vm, "error", err)
+				continue
 			}
+			slog.Warn("start guard: finished a start an interrupted daemon left paused: readied and resumed", "vm", vm)
 		}
-		if err != nil {
-			slog.Error("start guard: a start left paused by an interrupted daemon cannot be finished; it stays paused", "vm", vm, "error", err)
-			s.judgeStrandedStart(ctx, vm, err)
-			continue
-		}
-		s.unmarkStartPaused(vm)
-		slog.Warn("start guard: finished a start an interrupted daemon left paused: readied and resumed", "vm", vm)
-		s.judgeStrandedStart(ctx, vm, nil)
 	}
 }
 
@@ -199,8 +245,11 @@ func (s *Server) JudgeStrandedStarts(ctx context.Context) {
 			continue
 		}
 		vm, host, ok := health.SplitAccessVLANSubject(c.SubjectID)
-		if !ok || host != s.hostName || s.strandedStart(ctx, vm) {
+		if !ok || host != s.hostName {
 			continue
+		}
+		if v, _ := s.classifyStrandedStart(ctx, vm); v == strandedRefuse || v == strandedFinish {
+			continue // still a start left paused
 		}
 		s.judgeStrandedStart(ctx, vm, nil)
 	}
@@ -246,4 +295,46 @@ func (s *Server) domainIsUUID(vm, uuid string) bool {
 		return false
 	}
 	return strings.EqualFold(lv.UUIDFromXML(x), uuid)
+}
+
+// finishStartLeftPaused is `lv start` of a VM whose domain a start of this
+// host left paused (its start-paused record is there, the domain paused):
+// that start is finished — its firewall and VLANs, then the resume — and the
+// VM recorded running, instead of a second create libvirt would refuse. One
+// that cannot be finished (something holds it, or it is not provably that
+// start's) is refused, the record kept and the guest named. done says
+// whether it handled the start; when not, the start goes on as any other.
+func (s *Server) finishStartLeftPaused(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, bool, error) {
+	if marked, err := s.startPausedMarked(vm.Name); err != nil || !marked {
+		return nil, false, nil
+	}
+	verdict, why := s.classifyStrandedStart(ctx, vm.Name)
+	switch verdict {
+	case strandedDrop:
+		s.unmarkStartPaused(vm.Name)
+		return nil, false, nil
+	case strandedHeld:
+		return nil, true, status.Errorf(codes.FailedPrecondition,
+			"VM %q is paused here by an unfinished start, and %s; it stays paused", vm.Name, why)
+	case strandedRefuse:
+		err := errors.New(why)
+		s.judgeStrandedStart(ctx, vm.Name, err)
+		return nil, true, status.Errorf(codes.FailedPrecondition,
+			"VM %q is paused here by an unfinished start that cannot be finished: %s; stop it (`lv stop %s`) and start it again",
+			vm.Name, why, vm.Name)
+	}
+	if err := s.finishStrandedStart(ctx, vm.Name); err != nil {
+		return nil, true, status.Errorf(codes.FailedPrecondition,
+			"VM %q is paused here by an unfinished start, and finishing it failed: %v; it stays paused", vm.Name, err)
+	}
+	slog.Warn("StartVM: finished a start an interrupted daemon left paused", "vm", vm.Name)
+	s.noteVMStarted(vm.Name)
+	if err := s.persistVMState(ctx, vm.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", vm.Name, "error", err)
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.started", "ok", "finished a start an interrupted daemon left paused")
+	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_RUNNING}
+	hooks.Run(ctx, hooks.PostStart, pbVM, vmHooks(vm))
+	out, err := s.startedVMProto(ctx, vm.Name)
+	return out, true, err
 }

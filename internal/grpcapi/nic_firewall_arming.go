@@ -226,6 +226,16 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 			if err != nil {
 				return false, fmt.Errorf("whether %s's NICs have VLANs could not be read, so it is not run here: %w", name, err)
 			}
+			// A start this host left paused is not started again over it:
+			// libvirt refuses a second create of the active domain, and this
+			// start's end (PausedDone) would drop the record of the one that
+			// is not finished. `lv start` finishes it (finishStartLeftPaused).
+			if marked, merr := s.startPausedMarked(name); merr != nil || marked {
+				if active, aerr := s.virt.DomainIsActive(name); aerr != nil || active {
+					return false, fmt.Errorf("a start of %s this host left paused is not finished (its start-paused record is there); "+
+						"`lv start %s` finishes it", name, name)
+				}
+			}
 			if len(vlans) > 0 || s.needsPausedStart(ctx, name, false) {
 				// Recorded before the paused create, so a daemon that dies
 				// before the resume leaves evidence the sweep can trust

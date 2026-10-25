@@ -450,7 +450,7 @@ func logStaleHostPool(r StoragePoolRecord, hostN int64) {
 	}
 	slog.Warn("storage pool: born under an earlier lifetime of its host, which has been re-admitted since; "+
 		"it is not used, refreshed or reborn on its own (the host may have other storage); lv pool ls shows it as stale-host: "+
-		"create it again (lv pool create) if it still exists, or remove it (lv pool rm)",
+		"create it again (lv pool create) if it still exists, or remove it (lv pool delete)",
 		"host", r.HostName, "pool", r.Name, "pool_host_incarnation", r.HostIncarnation, "host_incarnation", hostN)
 }
 
@@ -478,7 +478,7 @@ func NoteStaleHostPools(ctx context.Context, c *Client, host string) error {
 // state) over the lifetime p was read from (p.Incarnation, as every pool
 // listing returns it). It never gives birth and never writes configuration:
 //   - a row deleted or re-created since p was read (another incarnation) is
-//     left alone, so a refresh that raced lv pool rm and create writes
+//     left alone, so a refresh that raced lv pool delete and create writes
 //     nothing into the new pool;
 //   - a pool born under an earlier lifetime of its host is left alone, and
 //     logged once (logStaleHostPool);

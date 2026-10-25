@@ -13,7 +13,7 @@ const poolStateDeparted = "departed"
 
 // poolStateStaleHost is the listed state of a pool born under an earlier
 // lifetime of its host (corrosion.ListStaleHostStoragePools): not used until
-// lv pool create makes it again, or lv pool rm removes it.
+// lv pool create makes it again, or lv pool delete removes it.
 const poolStateStaleHost = "stale-host"
 
 // ListStoragePools returns the pools the caller may view: global pools (any

@@ -59,7 +59,7 @@ removal is then not used: placement and every refresh leave it out, `lv pool
 ls` and `lv pool inspect` show its state as `stale-host`, and the daemon logs
 once that it belongs to an earlier lifetime of the host. Create it again with
 `lv pool create` if it still exists, in the project it belongs to, or remove it
-with `lv pool rm`, which removes only the row. A pool from the host's
+with `lv pool delete`, which removes only the row. A pool from the host's
 configuration file is registered again on its own.
 
 `--option k=v` is repeatable for driver-specific flags (Ceph keyring

@@ -57,7 +57,7 @@ const storagePoolUsable = `deleted_at IS NULL AND (incarnation = '' OR host_inca
 
 // GetStoragePoolAnyLifetime is GetStoragePool that also finds a pool born
 // under an earlier lifetime of its host (stale), which every listing leaves
-// out: what an ownership check (lv pool create) and lv pool rm must see.
+// out: what an ownership check (lv pool create) and lv pool delete must see.
 func GetStoragePoolAnyLifetime(ctx context.Context, c *Client, hostName, name string) (rec StoragePoolRecord, ok, stale bool, err error) {
 	rows, err := c.Query(ctx,
 		`SELECT `+storagePoolColumns+`, CASE WHEN `+storagePoolUsable+` THEN 0 ELSE 1 END AS stale

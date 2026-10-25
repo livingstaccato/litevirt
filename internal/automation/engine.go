@@ -116,7 +116,7 @@ func (e *Engine) decideAutomationUsing(ctx context.Context, cfg *corrosion.Voter
 	if p == nil {
 		p = claims.NewProposer(e.self, e.transport)
 	}
-	p.CallTimeout = 750 * time.Millisecond
+	p.CallTimeout = callTimeout(ctx)
 	spec := claims.Spec{Key: key, Generation: cfg.Generation, Voters: cfg.Names(), PrepareQuorum: corrosion.MajorityOf(len(cfg.Members)), MaxRounds: 8, Propose: propose, BeforeAccept: beforeAccept}
 	return p.Decide(ctx, spec)
 }

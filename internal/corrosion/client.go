@@ -118,13 +118,16 @@ type Client struct {
 	// Tests may commit real replicated facts here; production leaves it nil.
 	firewallIDAfterMoveCheck func()
 
-	automationSeams              *localCommitSeams
-	automationPublicationMu      sync.Mutex
-	automationPublicationDir     string
-	automationPublicationReady   bool
-	automationPublicationSeams   *localCommitSeams
-	automationExportBeforeRead   func()
-	automationSourceMu           sync.Mutex
+	automationSeams            *localCommitSeams
+	automationPublicationMu    sync.Mutex
+	automationPublicationDir   string
+	automationPublicationReady bool
+	automationPublicationSeams *localCommitSeams
+	automationExportBeforeRead func()
+	automationSourceMu         sync.Mutex
+	// automationEvidence is the gate's imported-voter evidence cache
+	// (automationEvidencedVotersTx).
+	automationEvidence           automationEvidence
 	automationSourceClosed       bool
 	automationSourcePreparations map[*AutomationSourcePreparation]bool
 	automationReceivers          map[*AutomationReceiver]bool

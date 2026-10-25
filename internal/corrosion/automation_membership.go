@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Automation across voter-membership changes (F1 Task 5).
@@ -173,7 +174,7 @@ func (c *Client) AutomationMembershipStanding(ctx context.Context) (AutomationMe
 			return nil
 		}
 		out.Voters = len(st.cfg.Members)
-		evidenced, err := automationEvidencedVotersTx(ctx, tx, st.cfg)
+		evidenced, err := c.automationEvidencedVotersTx(ctx, tx, st.cfg)
 		if err != nil {
 			return err
 		}
@@ -213,33 +214,69 @@ func (c *Client) AutomationMembershipStanding(ctx context.Context) (AutomationMe
 	return out, err
 }
 
-// automationEvidenceAnchors bounds how many of the newest anchors at the
-// adopted generation are read for signer evidence.
-const automationEvidenceAnchors = 64
+// automationEvidencePage and automationEvidencePages bound one evidence read:
+// at most automationEvidencePages pages of automationEvidencePage anchors.
+const (
+	automationEvidencePage  = 1024
+	automationEvidencePages = 8
+)
+
+// automationEvidence is the process-local evidence for one adopted
+// generation: every member that signed an accept in a verified automation
+// certificate anchored at it, accumulated over anchors up to cursor. Within a
+// generation it only grows, so the count cannot flap as newer anchors arrive.
+type automationEvidence struct {
+	mu      sync.Mutex
+	gen     int64
+	members string
+	cursor  int64
+	voters  map[string]bool
+}
 
 // automationEvidencedVotersTx returns the members of cfg (by name, under
 // their member incarnation) that signed an accept in an automation
-// certificate anchored at cfg's generation, newest first, bounded.
-func automationEvidencedVotersTx(ctx context.Context, tx *LocalTx, cfg *VoterConfig) (map[string]bool, error) {
-	out := map[string]bool{}
-	rows, err := tx.Query(ctx, `SELECT certificate FROM local_automation_anchors WHERE generation = ?
-		ORDER BY sequence DESC LIMIT ?`, cfg.Generation, automationEvidenceAnchors)
-	if err != nil {
-		return nil, err
+// certificate anchored at cfg's generation. It continues from the last anchor
+// it read, reading at most automationEvidencePages pages per call, so a
+// first read after a restart may undercount until it has caught up (fail
+// closed). A certificate upgraded in place below the cursor is not reread.
+func (c *Client) automationEvidencedVotersTx(ctx context.Context, tx *LocalTx, cfg *VoterConfig) (map[string]bool, error) {
+	ev := &c.automationEvidence
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	if members := MembersHash(cfg.Members); ev.gen != cfg.Generation || ev.members != members || ev.voters == nil {
+		ev.gen, ev.members, ev.cursor, ev.voters = cfg.Generation, members, 0, map[string]bool{}
 	}
-	for _, r := range rows {
-		cert, err := DecodeClaimCertificate(r.String("certificate"))
-		if err != nil || cert.ConfigGeneration != cfg.Generation {
-			continue
-		}
-		for _, a := range cert.Accepts {
-			if m, ok := cfg.Member(a.Voter); ok && m.Incarnation == a.VoterIncarnation && a.ConfigGeneration == cfg.Generation {
-				out[a.Voter] = true
-			}
-		}
-		if len(out) == len(cfg.Members) {
+	for range automationEvidencePages {
+		if len(ev.voters) == len(cfg.Members) {
 			break
 		}
+		rows, err := tx.Query(ctx, `SELECT sequence, generation, certificate FROM local_automation_anchors
+			WHERE sequence > ? ORDER BY sequence LIMIT ?`, ev.cursor, automationEvidencePage)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			ev.cursor = r.Int64("sequence")
+			if r.Int64("generation") != cfg.Generation {
+				continue
+			}
+			cert, err := DecodeClaimCertificate(r.String("certificate"))
+			if err != nil || cert.ConfigGeneration != cfg.Generation {
+				continue
+			}
+			for _, a := range cert.Accepts {
+				if m, ok := cfg.Member(a.Voter); ok && m.Incarnation == a.VoterIncarnation && a.ConfigGeneration == cfg.Generation {
+					ev.voters[a.Voter] = true
+				}
+			}
+		}
+		if len(rows) < automationEvidencePage {
+			break
+		}
+	}
+	out := make(map[string]bool, len(ev.voters))
+	for v := range ev.voters {
+		out[v] = true
 	}
 	return out, nil
 }

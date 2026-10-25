@@ -563,6 +563,8 @@ type Server struct {
 	// enforcement of automation_v1 (tokenEnabled, not_enforcing). The token is
 	// advertised on the build; activation is the daemon's automation gate.
 	enfAutomation atomic.Bool
+	// generationBarrier is AutomationGenerationBarrier retry state.
+	generationBarrier generationBarrierState
 	// enfPartitionPause is enforcement.partition_pause (default on): this node
 	// pauses its recoverable workloads on losing the voter majority, so it may
 	// advertise partition_pause_v1 (docs/design/partition-pause.md §5).

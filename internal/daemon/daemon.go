@@ -4524,7 +4524,7 @@ const voterAdoptionInterval = 5 * time.Second
 func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
 	t := time.NewTicker(voterAdoptionInterval)
 	defer t.Stop()
-	var lastErr, lastImportErr string
+	var lastErr, lastImportErr, lastBarrierErr string
 	for {
 		if _, err := svc.AdoptVoterConfigs(ctx); err != nil {
 			if err.Error() != lastErr {
@@ -4535,6 +4535,14 @@ func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
 			lastErr = ""
 		}
 		lastImportErr = d.importAutomationPrefix(ctx, svc, lastImportErr)
+		if err := svc.AutomationGenerationBarrier(ctx); err != nil {
+			if err.Error() != lastBarrierErr {
+				slog.Warn("automation: generation barrier did not certify; retrying after backoff", "error", err)
+			}
+			lastBarrierErr = err.Error()
+		} else {
+			lastBarrierErr = ""
+		}
 		select {
 		case <-ctx.Done():
 			return

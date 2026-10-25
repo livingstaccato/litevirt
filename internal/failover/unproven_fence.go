@@ -214,7 +214,8 @@ func unprovenRemedyOf(h *corrosion.HostRecord, r unprovenRaise) string {
 		out += fmt.Sprintf(". If %[1]s is up and answering (`lv host inspect %[1]s`) and none of its workloads runs anywhere "+
 			"else (`lv ls --host %[1]s` lists each one still recorded on it), `lv host undrain %[1]s` returns it to service: "+
 			"the coordinator moves nothing on a declined fence. Undraining a host that does not answer only has the "+
-			"coordinator judge the outage afresh: nothing moves until a new fence proves it off", h.Name)
+			"coordinator judge the outage afresh: nothing moves until a new fence proves it off. If any moved, use "+
+			"`lv host fence-confirm %[1]s` instead", h.Name)
 	}
 	return out
 }

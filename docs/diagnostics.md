@@ -1589,7 +1589,8 @@ recorded on it). The leader moves nothing on a declined fence, and the
 undrain starts nothing: it returns the host to service, and a host that does
 not answer is only judged afresh, with nothing moved until a new fence proves
 it off. An earlier resume of the same fence may have recovered part of the
-workloads, which is why the precondition is checked rather than assumed. The
+workloads, which is why the precondition is checked rather than assumed; if
+any moved, the remedy says to use `lv host fence-confirm <host>` instead. The
 same hold is named by the `host.recovery.stalled` notification, whose text
 follows the trust setting too. The detail is kept current while the hold
 lasts: a confirmation noted later as not standing, a later fence's failure, or

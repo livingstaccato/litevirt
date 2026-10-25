@@ -504,7 +504,7 @@ func TestUnprovenFence_ADeclinedRecordedFenceIsAHealthCondition(t *testing.T) {
 		t.Errorf("detail does not name the declined fence: %q", ev.Detail)
 	}
 	for _, want := range []string{"`lv host fence-confirm down`", "`lv host undrain down`",
-		"If down is up and answering", "none of its workloads runs anywhere else", "nothing moves until a new fence proves it off"} {
+		"If down is up and answering", "none of its workloads runs anywhere else", "nothing moves until a new fence proves it off", "If any moved, use `lv host fence-confirm down` instead"} {
 		if !strings.Contains(ev.Remedy, want) {
 			t.Errorf("remedy does not name %q: %q", want, ev.Remedy)
 		}

@@ -836,7 +836,8 @@ the leader moves nothing on a declined fence. If the host is up and answering
 (`lv host inspect <host>`) and none of its workloads runs anywhere else
 (`lv ls --host <host>` lists each one still recorded on it), `lv host undrain
 <host>` returns it to service. Check both: an earlier resume of the same fence
-may have recovered part of its workloads. Undraining a host that does not
+may have recovered part of its workloads, and if any moved, use
+`lv host fence-confirm <host>` instead. Undraining a host that does not
 answer only has the leader judge the outage afresh: nothing moves until a new
 fence proves it off.
 

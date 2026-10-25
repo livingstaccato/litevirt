@@ -90,16 +90,50 @@ func TestTrustSSH_TrustSetAgainResumesARevokedClaimRetry(t *testing.T) {
 // set during the hold is not trust recorded at judgement, on the live leader
 // as on a restarted one.
 func TestTrustSSH_TrustSetAfterAnUntrustedJudgementStillHolds(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		name := "live leader"
+		if restart {
+			name = "restarted leader"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, ctx := seedDownHost(t, "ssh", nil)
+			c := newTestCoordinator("coordinator", db)
+			c.SetFencer(confirmedSSH("managed"))
+			c.run(ctx)
+			setTrust(t, db, true)
+			if restart {
+				c = newTestCoordinator("coordinator", db)
+				c.SetFencer(confirmedSSH("managed"))
+			}
+			for i := 0; i < 3; i++ {
+				c.run(ctx)
+			}
+			if got := vmHost(t, db, ctx); got != "down" {
+				t.Fatalf("trust set after an untrusted judgement recovered the VM to %q", got)
+			}
+		})
+	}
+}
+
+// A fence judged untrusted is not re-decided every cycle once trust is set
+// later: trustRestored reports only a fence whose trust was recorded at
+// judgement (review round 2's churn guard).
+//
+// Mutation: drop RecordedTrust from trustRestored — red.
+func TestTrustSSH_UntrustedJudgementIsNotReDecidedEachCycle(t *testing.T) {
 	db, ctx := seedDownHost(t, "ssh", nil)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(confirmedSSH("managed"))
 	c.run(ctx)
 	setTrust(t, db, true)
-	for i := 0; i < 3; i++ {
-		c.run(ctx)
+	c.run(ctx)
+	c.run(ctx)
+	h, err := corrosion.GetHost(ctx, db, "down")
+	if err != nil || h == nil {
+		t.Fatal(err)
 	}
-	if got := vmHost(t, db, ctx); got != "down" {
-		t.Fatalf("trust set after an untrusted judgement recovered the VM to %q", got)
+	if c.trustRestored(h) {
+		t.Fatal("trustRestored reports a host whose fence was judged untrusted: it is re-decided every cycle")
 	}
 }
 
